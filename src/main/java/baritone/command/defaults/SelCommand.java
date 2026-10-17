@@ -195,8 +195,8 @@ public class SelCommand extends Command {
                 ISchematic schematic = create.apply(new FillSchematic(size.getX(), size.getY(), size.getZ(), type));
                 composite.put(schematic, min.x - origin.x, min.y - origin.y, min.z - origin.z);
             }
-            baritone.getBuilderProcess().build("Fill", composite, origin);
-            logDirect("Filling now");
+            baritone.getBuilderProcess().build(action == Action.CLEARAREA ? "clear area" : "Fill", composite, origin);
+            logDirect(action == Action.CLEARAREA ? "Clearing area in top-down zigzag layers" : "Filling now");
         } else if (action == Action.COPY) {
             BetterBlockPos playerPos = ctx.viewerPos();
             BetterBlockPos pos = args.hasAny() ? args.getDatatypePost(RelativeBlockPos.INSTANCE, playerPos) : playerPos;
