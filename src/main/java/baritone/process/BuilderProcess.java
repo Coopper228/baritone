@@ -599,7 +599,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             logDirect("Repeating build in vector " + repeat + ", new origin is " + origin);
             return onTick(calcFailed, isSafeToCancel, recursions + 1);
         }
-        if (Baritone.settings().distanceTrim.value) {
+        if (Baritone.settings().distanceTrim.value && !clearAreaMode) {
             trim();
         }
 
