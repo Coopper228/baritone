@@ -90,6 +90,9 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     private int numRepeats;
     private List<BlockState> approxPlaceable;
     public int stopAtHeight = 0;
+    private static final int CLEAR_AREA_LAYER_HEIGHT = 3;
+    private static final double CLEAR_AREA_PRIORITY_WEIGHT = 10_000.0;
+    private boolean clearAreaMode;
 
     public BuilderProcess(Baritone baritone) {
         super(baritone);
@@ -98,6 +101,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     @Override
     public void build(String name, ISchematic schematic, Vec3i origin) {
         this.name = name;
+        this.clearAreaMode = "clear area".equalsIgnoreCase(name);
         this.schematic = schematic;
         this.realSchematic = null;
         boolean buildingSelectionSchematic = schematic instanceof SelectionSchematic;
@@ -132,7 +136,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         this.origin = new Vec3i(x, y, z);
         this.paused = false;
-        this.layer = Baritone.settings().startAtLayer.value;
+        this.layer = clearAreaMode ? 0 : Baritone.settings().startAtLayer.value;
         this.stopAtHeight = schematic.heightY();
         if (Baritone.settings().buildOnlySelection.value && buildingSelectionSchematic) {  // currently redundant but safer maybe
             if (baritone.getSelectionManager().getSelections().length == 0) {
@@ -233,6 +237,55 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
     }
 
+    private boolean usesLayering() {
+        return clearAreaMode || Baritone.settings().buildInLayers.value;
+    }
+
+    private int effectiveLayerHeight() {
+        return clearAreaMode ? CLEAR_AREA_LAYER_HEIGHT : Baritone.settings().layerHeight.value;
+    }
+
+    private boolean layersTopDown() {
+        return clearAreaMode || Baritone.settings().layerOrder.value;
+    }
+
+    private long clearAreaPriority(BlockPos pos) {
+        int localX = pos.getX() - origin.getX();
+        int localY = pos.getY() - origin.getY();
+        int localZ = pos.getZ() - origin.getZ();
+        int width = schematic.widthX();
+        int length = schematic.lengthZ();
+        long xInRow = (localZ & 1) == 0 ? localX : width - 1L - localX;
+        long yFromTop = schematic.heightY() - 1L - localY;
+        return (yFromTop * length + localZ) * width + xInRow;
+    }
+
+    private BetterBlockPos nextClearAreaTarget(BuilderCalculationContext bcc) {
+        if (incorrectPositions == null) {
+            return null;
+        }
+        BetterBlockPos best = null;
+        long bestPriority = Long.MAX_VALUE;
+        for (BetterBlockPos pos : incorrectPositions) {
+            BlockState current = bcc.bsi.get0(pos);
+            if (current.getBlock() instanceof AirBlock
+                    || current.getBlock() == Blocks.WATER
+                    || current.getBlock() == Blocks.LAVA) {
+                continue;
+            }
+            BlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, current);
+            if (desired == null || !(desired.getBlock() instanceof AirBlock) || valid(current, desired, false)) {
+                continue;
+            }
+            long priority = clearAreaPriority(pos);
+            if (priority < bestPriority) {
+                best = pos;
+                bestPriority = priority;
+            }
+        }
+        return best;
+    }
+
     public void clearArea(BlockPos corner1, BlockPos corner2) {
         BlockPos origin = new BlockPos(Math.min(corner1.getX(), corner2.getX()), Math.min(corner1.getY(), corner2.getY()), Math.min(corner1.getZ(), corner2.getZ()));
         int widthX = Math.abs(corner1.getX() - corner2.getX()) + 1;
@@ -266,6 +319,26 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
     }
 
     private Optional<Pair<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
+        if (clearAreaMode) {
+            BetterBlockPos target = nextClearAreaTarget(bcc);
+            if (target == null) {
+                return Optional.empty();
+            }
+            BetterBlockPos center = ctx.playerFeet();
+            int dx = target.x - center.x;
+            int dy = target.y - center.y;
+            int dz = target.z - center.z;
+            int minDy = Baritone.settings().breakFromAbove.value ? -1 : 0;
+            if (Math.abs(dx) > 5 || dy < minDy || dy > 5 || Math.abs(dz) > 5) {
+                return Optional.empty();
+            }
+            BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
+            if (dy == -1 && target.x == pathStart.x && target.z == pathStart.z) {
+                return Optional.empty();
+            }
+            Optional<Rotation> rotation = RotationUtils.reachable(ctx, target, ctx.playerController().getBlockReachDistance());
+            return rotation.map(value -> new Pair<>(target, value));
+        }
         BetterBlockPos center = ctx.playerFeet();
         BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
         for (int dx = -5; dx <= 5; dx++) {
@@ -451,7 +524,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         if (paused) {
             return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
-        if (Baritone.settings().buildInLayers.value) {
+        if (usesLayering()) {
             if (realSchematic == null) {
                 realSchematic = schematic;
             }
@@ -460,11 +533,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             int maxYInclusive;
             // layer = 0 should be nothing
             // layer = realSchematic.heightY() should be everything
-            if (Baritone.settings().layerOrder.value) { // top to bottom
+            if (layersTopDown()) { // top to bottom
                 maxYInclusive = realSchematic.heightY() - 1;
-                minYInclusive = realSchematic.heightY() - layer * Baritone.settings().layerHeight.value;
+                minYInclusive = realSchematic.heightY() - layer * effectiveLayerHeight();
             } else {
-                maxYInclusive = layer * Baritone.settings().layerHeight.value - 1;
+                maxYInclusive = layer * effectiveLayerHeight() - 1;
                 minYInclusive = 0;
             }
             schematic = new ISchematic() {
@@ -501,7 +574,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         }
         BuilderCalculationContext bcc = new BuilderCalculationContext();
         if (!recalc(bcc)) {
-            if (Baritone.settings().buildInLayers.value && layer * Baritone.settings().layerHeight.value < stopAtHeight) {
+            if (usesLayering() && layer * effectiveLayerHeight() < stopAtHeight) {
                 logDirect("Starting layer " + layer);
                 layer++;
                 return onTick(calcFailed, isSafeToCancel, recursions + 1);
@@ -658,9 +731,11 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
     private void fullRecalc(BuilderCalculationContext bcc) {
         incorrectPositions = new HashSet<>();
-        for (int y = 0; y < schematic.heightY(); y++) {
+        for (int yStep = 0; yStep < schematic.heightY(); yStep++) {
+            int y = clearAreaMode ? schematic.heightY() - 1 - yStep : yStep;
             for (int z = 0; z < schematic.lengthZ(); z++) {
-                for (int x = 0; x < schematic.widthX(); x++) {
+                for (int xStep = 0; xStep < schematic.widthX(); xStep++) {
+                    int x = clearAreaMode && (z & 1) == 1 ? schematic.widthX() - 1 - xStep : xStep;
                     int blockX = x + origin.getX();
                     int blockY = y + origin.getY();
                     int blockZ = z + origin.getZ();
@@ -734,7 +809,10 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         });
         incorrectPositions.removeAll(outOfBounds);
         List<Goal> toBreak = new ArrayList<>();
-        breakable.forEach(pos -> toBreak.add(breakGoal(pos, bcc)));
+        breakable.forEach(pos -> {
+            Goal goal = breakGoal(pos, bcc);
+            toBreak.add(clearAreaMode ? new ClearAreaPriorityGoal(goal, clearAreaPriority(pos)) : goal);
+        });
         List<Goal> toPlace = new ArrayList<>();
         placeable.forEach(pos -> {
             if (!placeable.contains(pos.below()) && !placeable.contains(pos.below(2))) {
@@ -762,6 +840,53 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
             return null;
         }
         return new GoalComposite(toBreak.toArray(new Goal[0]));
+    }
+
+    private static final class ClearAreaPriorityGoal implements Goal {
+        private final Goal delegate;
+        private final long priority;
+
+        private ClearAreaPriorityGoal(Goal delegate, long priority) {
+            this.delegate = delegate;
+            this.priority = priority;
+        }
+
+        @Override
+        public boolean isInGoal(int x, int y, int z) {
+            return delegate.isInGoal(x, y, z);
+        }
+
+        @Override
+        public double heuristic(int x, int y, int z) {
+            return priority * CLEAR_AREA_PRIORITY_WEIGHT + delegate.heuristic(x, y, z);
+        }
+
+        @Override
+        public double heuristic() {
+            return priority * CLEAR_AREA_PRIORITY_WEIGHT + delegate.heuristic();
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof ClearAreaPriorityGoal)) {
+                return false;
+            }
+            ClearAreaPriorityGoal that = (ClearAreaPriorityGoal) other;
+            return priority == that.priority && delegate.equals(that.delegate);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * delegate.hashCode() + Long.hashCode(priority);
+        }
+
+        @Override
+        public String toString() {
+            return "ClearAreaPriorityGoal{priority=" + priority + ", delegate=" + delegate + "}";
+        }
     }
 
     public static class JankyGoalComposite implements Goal {
@@ -975,6 +1100,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
         schematic = null;
         realSchematic = null;
         layer = Baritone.settings().startAtLayer.value;
+        clearAreaMode = false;
         numRepeats = 0;
         paused = false;
         observedCompleted = null;
@@ -987,7 +1113,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
     @Override
     public Optional<Integer> getMinLayer() {
-        if (Baritone.settings().buildInLayers.value) {
+        if (usesLayering()) {
             return Optional.of(this.layer);
         }
         return Optional.empty();
@@ -995,7 +1121,7 @@ public final class BuilderProcess extends BaritoneProcessHelper implements IBuil
 
     @Override
     public Optional<Integer> getMaxLayer() {
-        if (Baritone.settings().buildInLayers.value) {
+        if (usesLayering()) {
             return Optional.of(this.stopAtHeight);
         }
         return Optional.empty();
